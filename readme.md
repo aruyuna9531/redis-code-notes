@@ -1,79 +1,15 @@
 # redis 源码阅读笔记（基于redis 7.2.4版本）
 
-## （1）数据结构篇
-五大基本结构及其底层数据结构变化
+## [（1）数据结构篇](1.data_structures.md)
 
-→表示不可逆（即不整个key删除重开的情况下，同一个key内即使更新后满足了箭头起点编码的条件，底层也不会回到那个结构）
-1. string：int（有符号int64范围内的数字）/ embstr（不包括int范围数字的短串）/raw（长串）
-2. list：ziplist / listpack（[*注1](#注1ziplist和listpack的区别)） → linkedlist（双向链表） 有单个过长元素会保持listpack，只有元素过多才会升级
-3. hash：ziplist / listpack → hashtable（存在过长的field或value）
-4. set：intset（全数字，参照int）（[*注2](#注2intset)） → ziplist / listpack（存在非数字或超大数字，少量元素，无过长元素）→hashtable（大量元素或有过长元素）
-5. zset：ziplist / listpack → skiplist 转换不受过大score影响，但受member长度影响
-6. stream（消息队列流，这个不知道算不算基础结构，但它也有一套curl操作）：stream
+## [（2）持久化相关](2.persistence.md)：RDB/AOF
 
-### 注1：ziplist和listpack的区别
-ziplist是7.0以前的压缩列表实现，listpack是7.0版本之后替换了ziplist的结构（但7.2.4的源码里仍然有ziplist的代码[ziplist.h](https://github.com/redis/redis/blob/unstable/src/ziplist.h)/[ziplist.c](https://github.com/redis/redis/blob/unstable/src/ziplist.c)，目前不知道哪些地方还在用它）。
+## [（3）集群](3.clusters.md)：主从/哨兵/cluster
 
-#### ziplist格式：ziplist.c开头就有说明
-```cpp
-// <zlbytes> <zltail> <zllen> <entry> <entry> ... <entry> <zlend>
-```
-如无特殊说明，数据都是小端序存储。
-* zlbytes (uint32_t) 整个ziplist占据了多少个字节（包括zlbytes本身的4）
-* zltail (uint32_t) 最后一个entry数据的偏移位。方便pop用的，可以直接定位最后元素。
-* zllen (uint16_t) 有多少个元素。但如果元素数量多于它能存的数（65535），这个值会固定为最大值，此时如果查它有多少个元素需要全数据扫描。
-* zlend (uint8_t) 结束符，ZIP_END（0xFF）。
+## [（4）Redis是单线程模型？](4.single_thread.md)
 
-最小的ziplist长度（上面的总和）：ZIPLIST_HEADER_SIZE（10）+ZIPLIST_END_SIZE（1）=11B
+## [（5）过期键回收](5.free.md)
 
+## [（6）事务 ](6.transaction.md)：multi VS eval
 
-entry的结构：
-```cpp
-// <prevlen> <encoding> <entry-data>
-```
-* prevlen 是前一个元素的长度，用来反向遍历可以直接定位到上一个元素的起始位。如果长度小于254（ZIP_BIG_PREVLEN），用1字节（uint8）存储，大于等于254的时候用5字节存储，第一字节固定0xFE（254），后4位存的是前一个entry的实际长度。
-* encoding是entry的编码格式（int或string，如果是string还要指定长度），但一个特殊情况如果是0xFF（255）则代表这个entry的结束（entry-data是可以不存在的）。前2位是编码类型。11代表这是个数字，后面6位有5中情况，0：int16，10000：int32，100000：int64，110000：24位整型，111110:8位整型。（都是有符号数）。编码类型不是11的时候代表字符串，其中00代表63B以下的字符串（后面6位就是长度），01代表16383B以下字符串，encoding会占用2字节，后14位是长度。10开头代表长度大于16384B的字符串，endodng会占用5字节，第一字节恒定10000000（后面6位不使用），后面4字节是字符串长度。Encoding的字节排布使用大端序。
-
-ziplist的问题：如果在中间插入元素或者更新元素，有可能会导致entry连锁更新，因为prevlen的长度和encoding的长度本身是变长的，这一改变可能导致后面那个元素本身的size发生变更，因为自己长度变得大于254，或者插入了一个长度大于254的元素，它后面的prevlen就从1字节扩到5字节，万一这次变更导致下一个元素长度超过了254，又会引起下下个元素的改变，可能还没完），会极大地影响效率。
-
-#### Listpack结构：
-```cpp
-// <tot-bytes> <num-elements> <element-1> ... <element-N> <listpack-end-byte>
-```
-
-* Tot_bytes [uint32_t] listpack总长度
-* Num_elements [uint16_t] 元素个数，大于等于65535时，这个值固定为65535，获取数量的时候仍要遍历整个Pack（和zllen一样）
-* Listpack-end-byte：结束位，0xFF。
-
-Entry的结构：
-```cpp
-// <encoding-type><element-data><element-tot-len>
-```
-data可能是缺失的，因为encoding-type可能已经包含了数据（小于127的数字）。
-
-Encoding type：
-* 首位0，表示小数字，后面7位直接挤入数据本身
-* 首2位10，表示小字符串（<=63B），后面6位是字符串长度，然后后面的内存接字符串内容。
-* 首3位110，表示13位整型，后面5位加额外1字节共13位存数字。
-* 前4位1110，4095B以下的字符串。后面4位加额外1字节是字符串长度，然后接字符串内容。
-* 前4位是1111时，这个字节就完全代表type，后4位会根据以下情况决定内容：
-0(0000) 大字符串，后面用额外4字节先存字符串长度，然后是内容。
-1(0001) 16位整型，后面接2字节数据（下同）
-2(0002) 24位整型
-3(0003) 32位整型
-4(0004) 64位整型
-其他的未使用。
-* Tot-len表示这个entry的数据长度（不包括自身），字节数小于等于5。第一个bit表示是否结束。这个是大端序存储的，原因是要支持反向遍历（见下）。
-
-这样新增或修改元素就只会修改自己entry的内容，不会涉及其他entry的更新，避免了连锁更新。
-
-那ziplist的prevlen一开始承担的功能（反向遍历）要如何做？
-
-- 根据totlen，因为最高位是1的时候代表不是totlen的最后一字节，就还要往前搜直到最高位是0，因此通过有限次遍历能获得上一个字节的encoding+data总长度，就可以直接定位到前一个entry的首位。
-
-最小字节数：LP_header+EOF，最小字节数为7
-
-### 注2：intset
-intset是redis存储少量int64类型元素时使用的数据结构，这种设计优先从内存占用考虑的。
-
-intset占用空间小（每个元素最多就8字节，压缩列表存储同等元素要加一大堆花里胡哨的头和尾，hashtable更是有哈希表、链表指针等额外内存开销），查找元素是否存在的时候可使用二分查找（[intset.c:137](https://github.com/redis/redis/blob/unstable/src/intset.c)），可以有优秀的查找效率。另两种结构内存开销很大。但intset的性能不如hashtable（那个是O1），所以intset适用于元素少的情况。
+主程序main入口：[server.c:6889](https://github.com/redis/redis/blob/unstable/src/server.c)
